@@ -199,9 +199,18 @@ func IntegrationDocker(configFile string) error {
 		_ = down.Run()
 	}()
 
-	// --build because run reuses whatever image already exists, which would
-	// silently test a stale one after any source or Dockerfile change.
-	cmd := exec.Command("docker", "compose", "-f", composeFile, "run", "--build", "--rm", "test")
+	// Build both images explicitly: run --build only names the test service,
+	// while the LiveKit server is a built dependency and could otherwise be
+	// missing or stale.
+	build := exec.Command("docker", "compose", "-f", composeFile, "build", "livekit", "test")
+	build.Env = env
+	build.Stdout = os.Stdout
+	build.Stderr = os.Stderr
+	if err := build.Run(); err != nil {
+		return err
+	}
+
+	cmd := exec.Command("docker", "compose", "-f", composeFile, "run", "--rm", "test")
 	cmd.Env = env
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

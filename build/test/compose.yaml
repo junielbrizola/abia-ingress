@@ -42,7 +42,10 @@ services:
   # other container. The healthcheck goes through the service name for the
   # same reason, since one on localhost passes while nothing can reach it.
   livekit:
-    image: livekit/livekit-server:latest
+    image: abia-realtime-server:ingress-test
+    build:
+      context: ../../..
+      dockerfile: server/Dockerfile
     command: --dev --bind 0.0.0.0
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://livekit:7880"]
