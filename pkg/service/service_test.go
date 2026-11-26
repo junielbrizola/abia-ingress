@@ -42,7 +42,7 @@ func TestPublishRequestWithEmptyStreamKeyIsClientError(t *testing.T) {
 			return err
 		},
 		"rtmp": func(s *Service) error {
-			_, _, err := s.HandleRTMPPublishRequest("", testResourceID)
+			_, err := s.HandleRTMPPublishRequest("", testResourceID)
 			return err
 		},
 	}

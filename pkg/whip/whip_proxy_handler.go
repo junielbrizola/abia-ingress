@@ -40,7 +40,11 @@ import (
 )
 
 const (
-	sessionNotifyTimeout = 3 * time.Minute
+	sessionNotifyTimeout     = 3 * time.Minute
+	proxyRequestTimeout      = 5 * time.Second
+	proxyDeleteTimeout       = 5 * time.Second
+	maxProxyResponseBodySize = 1 << 20
+	maxDeleteResponseSize    = 1 << 20
 )
 
 type proxyWhipHandler struct {
@@ -53,17 +57,27 @@ type proxyWhipHandler struct {
 	done      core.Fuse
 	rpcServer rpc.IngressHandlerServer
 
-	mu       sync.Mutex
-	watchdog *time.Timer
+	mu                    sync.Mutex
+	closeOnce             sync.Once
+	watchdog              *time.Timer
+	closed                bool
+	initStarted           bool
+	initCompleted         bool
+	readyClaimed          bool
+	readyDone             chan struct{}
+	initCancel            context.CancelFunc
+	initDone              chan struct{}
+	notifyTopicRegistered bool
 }
 
 func NewProxyWHIPHandler(p *params.Params, bus psrpc.MessageBus, ua string) (WHIPHandler, error) {
 	// RPC is handled in the handler process when transcoding
 
 	h := &proxyWhipHandler{
-		params: p,
-		logger: p.GetLogger(),
-		ua:     ua,
+		params:   p,
+		logger:   p.GetLogger(),
+		ua:       ua,
+		initDone: make(chan struct{}),
 	}
 
 	rpcServer, err := rpc.NewIngressHandlerServer(h, bus, psrpc.WithServerSkipClaim(p.SkipClaimEnabled))
@@ -98,7 +112,28 @@ func getErrorCodeForStatus(statusCode int) psrpc.ErrorCode {
 	}
 }
 
-func (h *proxyWhipHandler) Init(_ context.Context, sdpOffer string) (*WHIPInitResponse, error) {
+func (h *proxyWhipHandler) Init(ctx context.Context, sdpOffer string) (_ *WHIPInitResponse, initErr error) {
+	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		return nil, context.Canceled
+	}
+	if h.initStarted {
+		h.mu.Unlock()
+		return nil, psrpc.NewErrorf(psrpc.FailedPrecondition, "WHIP initialization already started")
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, proxyRequestTimeout)
+	h.initStarted = true
+	h.initCancel = cancel
+	h.mu.Unlock()
+	defer func() {
+		cancel()
+		h.mu.Lock()
+		h.initCancel = nil
+		close(h.initDone)
+		h.mu.Unlock()
+	}()
+
 	protocol := "http"
 	urlBase := ""
 	switch {
@@ -122,7 +157,7 @@ func (h *proxyWhipHandler) Init(_ context.Context, sdpOffer string) (*WHIPInitRe
 		return nil, err
 	}
 
-	req, err := http.NewRequest("POST", urlObj.String(), bytes.NewReader([]byte(sdpOffer)))
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, urlObj.String(), bytes.NewReader([]byte(sdpOffer)))
 	if err != nil {
 		return nil, err
 	}
@@ -159,18 +194,35 @@ func (h *proxyWhipHandler) Init(_ context.Context, sdpOffer string) (*WHIPInitRe
 
 	location := urlObj.ResolveReference(locationHeaderUrl)
 
+	participantID := location.Path[strings.LastIndex(location.Path, "/")+1:]
+	h.mu.Lock()
 	h.location = location
-	h.participantID = location.Path[strings.LastIndex(location.Path, "/")+1:]
-	if h.participantID != "" {
-		if err = h.rpcServer.RegisterWHIPRTCConnectionNotifyTopic(h.participantID); err != nil {
+	h.participantID = participantID
+	if h.closed {
+		h.mu.Unlock()
+		return nil, context.Canceled
+	}
+	if participantID != "" {
+		if err = h.rpcServer.RegisterWHIPRTCConnectionNotifyTopic(participantID); err != nil {
+			h.mu.Unlock()
 			return nil, err
 		}
+		h.notifyTopicRegistered = true
 	}
+	h.mu.Unlock()
 
-	b, err := io.ReadAll(resp.Body)
+	b, err := readProxyWHIPResponseBody(resp.Body)
 	if err != nil {
 		return nil, err
 	}
+
+	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		return nil, context.Canceled
+	}
+	h.initCompleted = true
+	h.mu.Unlock()
 
 	return &WHIPInitResponse{
 		SDPAnswer:   string(b),
@@ -179,11 +231,56 @@ func (h *proxyWhipHandler) Init(_ context.Context, sdpOffer string) (*WHIPInitRe
 	}, nil
 }
 
+func readProxyWHIPResponseBody(body io.Reader) ([]byte, error) {
+	responseBody, err := io.ReadAll(io.LimitReader(body, maxProxyResponseBodySize+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(responseBody) > maxProxyResponseBodySize {
+		return nil, psrpc.NewErrorf(psrpc.MalformedResponse, "WHIP upstream response exceeds the 1 MiB limit")
+	}
+	return responseBody, nil
+}
+
 func (h *proxyWhipHandler) SetMediaStatsGatherer(_ *stats.LocalMediaStatsGatherer) {
 }
 
 func (h *proxyWhipHandler) Start(_ context.Context) (map[types.StreamKind]string, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return nil, context.Canceled
+	}
+	if !h.initCompleted {
+		return nil, psrpc.NewErrorf(psrpc.FailedPrecondition, "WHIP initialization is not complete")
+	}
 	return nil, nil
+}
+
+// runReady serializes the ready callback with close. A close that starts first
+// prevents callback admission; a close that races an admitted callback waits
+// for its state transition to finish before deleting the upstream resource.
+func (h *proxyWhipHandler) runReady(fn func()) bool {
+	h.mu.Lock()
+	if h.closed || h.readyClaimed {
+		h.mu.Unlock()
+		return false
+	}
+	h.readyClaimed = true
+	done := make(chan struct{})
+	h.readyDone = done
+	h.mu.Unlock()
+	defer func() {
+		close(done)
+		h.mu.Lock()
+		h.readyDone = nil
+		h.mu.Unlock()
+	}()
+
+	if fn != nil {
+		fn()
+	}
+	return true
 }
 
 func (h *proxyWhipHandler) Close() {
@@ -191,56 +288,79 @@ func (h *proxyWhipHandler) Close() {
 }
 
 func (h *proxyWhipHandler) close(isRTCClosed bool) {
-	if !h.done.Break() {
-		return
-	}
-
-	h.mu.Lock()
-	if h.watchdog != nil {
-		h.watchdog.Stop()
-		h.watchdog = nil
-	}
-	h.mu.Unlock()
-
-	utils.DeregisterIngressRpcHandlers(h.rpcServer, h.params.IngressInfo)
-	if h.participantID != "" {
-		if isRTCClosed {
-			h.rpcServer.DeregisterWHIPRTCConnectionNotifyTopic(h.participantID)
-		} else {
-			// wait a bit before deregistering, in case sfu would send rtc closed notify
-			time.AfterFunc(5*time.Second, func() { h.rpcServer.DeregisterWHIPRTCConnectionNotifyTopic(h.participantID) })
+	h.closeOnce.Do(func() {
+		h.mu.Lock()
+		h.closed = true
+		cancelInit := h.initCancel
+		waitForInit := h.initStarted
+		readyDone := h.readyDone
+		h.done.Break()
+		if h.watchdog != nil {
+			h.watchdog.Stop()
+			h.watchdog = nil
 		}
-	}
+		h.mu.Unlock()
+		if cancelInit != nil {
+			cancelInit()
+		}
+		if waitForInit {
+			// Init is bounded by proxyRequestTimeout and cancellation. Waiting here
+			// ensures a late successful POST publishes Location before cleanup reads it.
+			<-h.initDone
+		}
+		if readyDone != nil {
+			<-readyDone
+		}
 
-	h.logger.Infow("closing WHIP session", "location", h.location, "isRTCClosed", isRTCClosed)
+		h.mu.Lock()
+		location := h.location
+		participantID := h.participantID
+		notifyTopicRegistered := h.notifyTopicRegistered
+		h.mu.Unlock()
 
-	if h.location == nil || isRTCClosed {
-		return
-	}
+		utils.DeregisterIngressRpcHandlers(h.rpcServer, h.params.IngressInfo)
+		if notifyTopicRegistered && participantID != "" {
+			if isRTCClosed {
+				h.rpcServer.DeregisterWHIPRTCConnectionNotifyTopic(participantID)
+			} else {
+				// wait a bit before deregistering, in case sfu would send rtc closed notify
+				time.AfterFunc(5*time.Second, func() { h.rpcServer.DeregisterWHIPRTCConnectionNotifyTopic(participantID) })
+			}
+		}
 
-	req, err := http.NewRequest("DELETE", h.location.String(), nil)
-	if err != nil {
-		h.logger.Warnw("WHIP DELETE request creation failed", err)
-		return
-	}
+		h.logger.Infow("closing WHIP session", "location", location, "isRTCClosed", isRTCClosed)
 
-	req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", h.params.Token))
+		if location == nil || isRTCClosed {
+			return
+		}
 
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		h.logger.Warnw("WHIP DELETE request failed", err)
-		return
-	}
-	defer resp.Body.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), proxyDeleteTimeout)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodDelete, location.String(), nil)
+		if err != nil {
+			h.logger.Warnw("WHIP DELETE request creation failed", err)
+			return
+		}
 
-	h.logger.Infow("requested WHIP resource deletion", "url", h.location, "statusCode", resp.StatusCode)
+		req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", h.params.Token))
 
-	code := getErrorCodeForStatus(resp.StatusCode)
-	if code != psrpc.OK {
-		err = psrpc.NewError(code, errors.NewHTTPErrorFromResponse(resp))
-		h.logger.Warnw("WHIP delete request returned error status code", err, "statusCode", resp.StatusCode)
-		return
-	}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			h.logger.Warnw("WHIP DELETE request failed", err)
+			return
+		}
+		defer resp.Body.Close()
+
+		code := getErrorCodeForStatus(resp.StatusCode)
+		if code != psrpc.OK {
+			err = psrpc.NewError(code, errors.NewHTTPErrorFromResponse(resp))
+			h.logger.Warnw("WHIP delete request returned error status code", err, "statusCode", resp.StatusCode)
+			return
+		}
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDeleteResponseSize))
+
+		h.logger.Infow("requested WHIP resource deletion", "url", location, "statusCode", resp.StatusCode)
+	})
 }
 
 func (h *proxyWhipHandler) WaitForSessionEnd(ctx context.Context) error {
@@ -292,15 +412,20 @@ func (h *proxyWhipHandler) DeleteWHIPResource(ctx context.Context, req *rpc.Dele
 	return &google_protobuf2.Empty{}, nil
 }
 
-func (h *proxyWhipHandler) ICERestartWHIPResource(_ context.Context, req *rpc.ICERestartWHIPResourceRequest) (*rpc.ICERestartWHIPResourceResponse, error) {
+func (h *proxyWhipHandler) ICERestartWHIPResource(ctx context.Context, req *rpc.ICERestartWHIPResourceRequest) (*rpc.ICERestartWHIPResourceResponse, error) {
+	h.mu.Lock()
+	location := h.location
+	closed := h.closed
+	h.mu.Unlock()
+	h.logger.Infow("restarting ICE for WHIP session", "location", location)
 
-	h.logger.Infow("closing WHIP session", "location", h.location)
-
-	if h.location == nil {
+	if location == nil || closed {
 		return nil, psrpc.NewErrorf(psrpc.FailedPrecondition, "WHIP session not established")
 	}
 
-	wreq, err := http.NewRequest("PATCH", h.location.String(), bytes.NewReader([]byte(req.RawTrickleIceSdpfrag)))
+	requestCtx, cancel := context.WithTimeout(ctx, proxyRequestTimeout)
+	defer cancel()
+	wreq, err := http.NewRequestWithContext(requestCtx, http.MethodPatch, location.String(), bytes.NewReader([]byte(req.RawTrickleIceSdpfrag)))
 	if err != nil {
 		return nil, err
 	}
@@ -315,14 +440,14 @@ func (h *proxyWhipHandler) ICERestartWHIPResource(_ context.Context, req *rpc.IC
 	}
 	defer resp.Body.Close()
 
-	h.logger.Infow("requested WHIP resource deletion", "url", h.location, "statusCode", resp.StatusCode)
+	h.logger.Infow("requested WHIP ICE restart", "url", location, "statusCode", resp.StatusCode)
 
 	code := getErrorCodeForStatus(resp.StatusCode)
 	if code != psrpc.OK {
 		return nil, psrpc.NewError(code, errors.NewHTTPErrorFromResponse(resp))
 	}
 
-	sdpResponse, err := io.ReadAll(resp.Body)
+	sdpResponse, err := readProxyWHIPResponseBody(resp.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -337,7 +462,9 @@ func (h *proxyWhipHandler) WHIPRTCConnectionNotify(_ context.Context, req *rpc.W
 	tctx, done := context.WithTimeout(context.Background(), 10*time.Second)
 	defer done()
 
-	h.resetWatchDog()
+	if !h.resetWatchDog() {
+		return &google_protobuf2.Empty{}, nil
+	}
 
 	if req.Video != nil {
 		h.params.SetInputVideoState(tctx, req.Video, true, true)
@@ -354,15 +481,19 @@ func (h *proxyWhipHandler) WHIPRTCConnectionNotify(_ context.Context, req *rpc.W
 	return &google_protobuf2.Empty{}, nil
 }
 
-func (h *proxyWhipHandler) resetWatchDog() {
+func (h *proxyWhipHandler) resetWatchDog() bool {
 	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return false
+	}
 	if h.watchdog != nil {
 		h.watchdog.Stop()
 	}
 
 	h.watchdog = time.AfterFunc(sessionNotifyTimeout, func() {
 		h.logger.Infow("no Notify call from the SFU, terminating ingress")
-		h.done.Break()
+		h.close(false)
 	})
-	h.mu.Unlock()
+	return true
 }

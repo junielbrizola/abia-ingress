@@ -182,7 +182,7 @@ func NewService(
 	return s, nil
 }
 
-func (s *Service) HandleRTMPPublishRequest(streamKey, resourceId string) (*params.Params, *stats.LocalMediaStatsGatherer, error) {
+func (s *Service) HandleRTMPPublishRequest(streamKey, resourceId string) (*rtmp.PublishSession, error) {
 	ctx, span := tracer.Start(context.Background(), "Service.HandleRTMPPublishRequest")
 	defer span.End()
 
@@ -192,25 +192,22 @@ func (s *Service) HandleRTMPPublishRequest(streamKey, resourceId string) (*param
 		inputType:  livekit.IngressInput_RTMP_INPUT,
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	err = s.manager.startIngress(ctx, p, func(_ context.Context) {
-		s.rtmpSrv.CloseHandler(resourceId)
-	})
-	if err != nil {
-		// The session was announced by its first state update and is not going to
-		// run, so nothing else will report it as over.
-		s.stateNotifier.SessionEnded(ctx, p.State.ResourceId)
-		return nil, nil, err
-	}
+	return &rtmp.PublishSession{
+		Params: p,
+		Start: func() (*stats.LocalMediaStatsGatherer, error) {
+			if err := s.manager.startIngress(ctx, p, func(_ context.Context) {
+				s.rtmpSrv.CloseHandler(resourceId)
+			}); err != nil {
+				s.reportStartFailure(ctx, p, err)
+				return nil, err
+			}
 
-	stats, err := s.sm.GetIngressMediaStats(resourceId)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return p, stats, nil
+			return s.sm.GetIngressMediaStats(resourceId)
+		},
+	}, nil
 }
 
 func (s *Service) HandleWHIPPublishRequest(streamKey, resourceId string) (p *params.Params, ready func(mimeTypes map[types.StreamKind]string, err error) *stats.LocalMediaStatsGatherer, ended func(err error), err error) {
@@ -262,7 +259,13 @@ func (s *Service) HandleWHIPPublishRequest(streamKey, resourceId string) (p *par
 				s.whipSrv.CloseHandler(resourceId)
 			})
 			if err != nil {
-				s.stateNotifier.SessionEnded(ctx, p.State.ResourceId)
+				// h.Start has already succeeded, so createStream will wait for the
+				// session to end even though no transcoding process was launched.
+				// Close it here because the transcoded path has no ended callback.
+				// createStream runs this callback under the WHIP handler lifecycle
+				// gate; defer close so cleanup cannot re-enter that gate.
+				go s.whipSrv.CloseHandler(resourceId)
+				s.reportStartFailure(ctx, p, err)
 				return nil
 			}
 		}
@@ -317,17 +320,26 @@ func (s *Service) HandleURLPublishRequest(ctx context.Context, resourceId string
 	// The caller's deadline can expire while handleRequest runs. Spawning after
 	// that leaves a handler nothing will reap.
 	if err := ctx.Err(); err != nil {
-		s.stateNotifier.SessionEnded(context.WithoutCancel(ctx), p.State.ResourceId)
+		s.reportStartFailure(ctx, p, err)
 		return nil, err
 	}
 
 	err = s.manager.startIngress(ctx, p, nil)
 	if err != nil {
-		s.stateNotifier.SessionEnded(ctx, p.State.ResourceId)
+		s.reportStartFailure(ctx, p, err)
 		return nil, err
 	}
 
 	return p.IngressInfo, nil
+}
+
+// reportStartFailure closes the lifecycle of an ingress that was already
+// announced as buffering but whose handler process never started.
+func (s *Service) reportStartFailure(ctx context.Context, p *params.Params, err error) {
+	ctx = context.WithoutCancel(ctx)
+	p.SetStatus(livekit.IngressState_ENDPOINT_ERROR, err)
+	p.SendStateUpdate(ctx)
+	s.stateNotifier.SessionEnded(ctx, p.State.ResourceId)
 }
 
 func (s *Service) handleRequest(ctx context.Context, req requestParams) (p *params.Params, err error) {
@@ -343,7 +355,9 @@ func (s *Service) handleRequest(ctx context.Context, req requestParams) (p *para
 		return nil, errors.ErrMissingStreamKey
 	}
 
-	res := make(chan publishResponse)
+	workCtx, cancelWork := context.WithCancel(ctx)
+	defer cancelWork()
+	res := make(chan publishResponse, 1)
 
 	go func() {
 		var p *params.Params
@@ -364,7 +378,7 @@ func (s *Service) handleRequest(ctx context.Context, req requestParams) (p *para
 		rp := req
 		if rp.info == nil {
 			var resp *rpc.GetIngressInfoResponse
-			resp, err = s.psrpcClient.GetIngressInfo(ctx, &rpc.GetIngressInfoRequest{
+			resp, err = s.psrpcClient.GetIngressInfo(workCtx, &rpc.GetIngressInfoRequest{
 				StreamKey: rp.streamKey,
 			})
 			if err != nil {
@@ -380,12 +394,12 @@ func (s *Service) handleRequest(ctx context.Context, req requestParams) (p *para
 			rp.loggingFields = resp.LoggingFields
 		}
 
-		p, err = s.handleNewPublisher(ctx, rp)
+		p, err = s.handleNewPublisher(workCtx, rp)
 		if p != nil {
 			rp.info = p.IngressInfo
 		}
 
-		if cerr := s.sendUpdate(ctx, rp.projectID, rp.inputType, rp.info, err); cerr != nil {
+		if cerr := s.sendUpdate(workCtx, rp.projectID, rp.inputType, rp.info, err); cerr != nil {
 			err = cerr
 			return
 		}
@@ -397,6 +411,15 @@ func (s *Service) handleRequest(ctx context.Context, req requestParams) (p *para
 
 	select {
 	case <-s.shutdown.Watch():
+		cancelWork()
+		pub := <-res
+		if pub.params != nil {
+			failure := pub.err
+			if failure == nil {
+				failure = errors.ErrServerShuttingDown
+			}
+			s.reportStartFailure(context.WithoutCancel(ctx), pub.params, failure)
+		}
 		return nil, errors.ErrServerShuttingDown
 	case pub := <-res:
 		return pub.params, pub.err
@@ -479,7 +502,7 @@ func (s *Service) Run() error {
 
 	<-s.shutdown.Watch()
 	logger.Infow("shutting down")
-	for !s.sm.IsIdle() {
+	for !s.sm.IsIdle() || !s.manager.IsIdle() {
 		logger.Debugw("instance waiting for sessions to finish", "sessions_count", len(s.ListIngress()))
 		time.Sleep(shutdownTimer)
 	}
@@ -547,12 +570,9 @@ func (s *Service) Resume() {
 }
 
 func (s *Service) Stop(kill bool) {
-	s.shutdown.Break()
+	s.manager.shutdown(kill)
 	s.monitor.Shutdown()
-
-	if kill {
-		s.manager.killAll()
-	}
+	s.shutdown.Break()
 }
 
 func (s *Service) ListIngress() []*rpc.IngressSession {
@@ -600,6 +620,7 @@ func (s *Service) AvailabilityHandler(w http.ResponseWriter, _ *http.Request) {
 	if !s.CanAccept() {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_, _ = w.Write([]byte("No availability"))
+		return
 	}
 
 	_, _ = w.Write([]byte("Available"))

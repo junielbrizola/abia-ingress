@@ -45,6 +45,14 @@ type RTMPServer struct {
 	monitor  *stats.Monitor
 }
 
+// PublishSession separates ingress preparation from starting its handler. The
+// RTMP handler publishes itself to the relay map after its Params are ready and
+// before calling Start, so the child process cannot race relay association.
+type PublishSession struct {
+	Params *params.Params
+	Start  func() (*stats.LocalMediaStatsGatherer, error)
+}
+
 func NewRTMPServer() *RTMPServer {
 	return &RTMPServer{}
 }
@@ -53,7 +61,7 @@ func (s *RTMPServer) SetMonitor(monitor *stats.Monitor) {
 	s.monitor = monitor
 }
 
-func (s *RTMPServer) Start(conf *config.Config, onPublish func(streamKey, resourceId string) (*params.Params, *stats.LocalMediaStatsGatherer, error)) error {
+func (s *RTMPServer) Start(conf *config.Config, onPublish func(streamKey, resourceId string) (*PublishSession, error)) error {
 	port := conf.RTMPPort
 
 	tcpAddr, err := net.ResolveTCPAddr("tcp", fmt.Sprintf(":%d", port))
@@ -78,20 +86,32 @@ func (s *RTMPServer) Start(conf *config.Config, onPublish func(streamKey, resour
 
 			h := NewRTMPHandler()
 			h.SetMonitor(s.monitor)
-			h.OnPublishCallback(func(streamKey, resourceId string) (*params.Params, *stats.LocalMediaStatsGatherer, error) {
-				var params *params.Params
-				var stats *stats.LocalMediaStatsGatherer
-				var err error
-				if onPublish != nil {
-					params, stats, err = onPublish(streamKey, resourceId)
-					if err != nil {
-						return nil, nil, err
-					}
+			h.OnPublishCallback(func(streamKey, resourceId string) (*PublishSession, error) {
+				if onPublish == nil {
+					return nil, errors.ErrIngressNotFound
 				}
 
-				s.handlers.Store(resourceId, h)
+				session, err := onPublish(streamKey, resourceId)
+				if err != nil {
+					return nil, err
+				}
+				if session == nil || session.Params == nil || session.Start == nil {
+					return nil, errors.ErrIngressNotFound
+				}
 
-				return params, stats, nil
+				start := session.Start
+				session.Start = func() (*stats.LocalMediaStatsGatherer, error) {
+					// OnPublish sets h.params before invoking Start. Store the handler
+					// before starting the child, whose first action is the relay GET.
+					s.handlers.Store(resourceId, h)
+					gatherer, err := start()
+					if err != nil {
+						s.handlers.Delete(resourceId)
+					}
+					return gatherer, err
+				}
+
+				return session, nil
 			})
 			h.OnCloseCallback(func(resourceId string) {
 				s.handlers.Delete(resourceId)
@@ -168,7 +188,7 @@ type RTMPHandler struct {
 	closed  core.Fuse
 	monitor *stats.Monitor
 
-	onPublish func(streamKey, resourceId string) (*params.Params, *stats.LocalMediaStatsGatherer, error)
+	onPublish func(streamKey, resourceId string) (*PublishSession, error)
 	onClose   func(resourceId string)
 }
 
@@ -192,7 +212,7 @@ func (h *RTMPHandler) SetMonitor(monitor *stats.Monitor) {
 	h.monitor = monitor
 }
 
-func (h *RTMPHandler) OnPublishCallback(cb func(streamKey, resourceId string) (*params.Params, *stats.LocalMediaStatsGatherer, error)) {
+func (h *RTMPHandler) OnPublishCallback(cb func(streamKey, resourceId string) (*PublishSession, error)) {
 	h.onPublish = cb
 }
 
@@ -214,11 +234,22 @@ func (h *RTMPHandler) OnPublish(_ *rtmp.StreamContext, _ uint32, cmd *rtmpmsg.Ne
 	h.resourceId = protoutils.NewGuid(protoutils.RTMPResourcePrefix)
 	h.log = logger.GetLogger().WithValues("streamKey", streamKey, "resourceID", h.resourceId)
 	if h.onPublish != nil {
-		params, st, err := h.onPublish(streamKey, h.resourceId)
+		session, err := h.onPublish(streamKey, h.resourceId)
 		if err != nil {
 			return err
 		}
-		h.params = params
+		if session == nil || session.Params == nil || session.Start == nil {
+			return errors.ErrIngressNotFound
+		}
+
+		h.params = session.Params
+		st, err := session.Start()
+		if err != nil {
+			return err
+		}
+		if st == nil {
+			return errors.ErrIngressNotFound
+		}
 
 		h.trackStats[types.Audio] = st.RegisterTrackStats(stats.InputAudio)
 		h.trackStats[types.Video] = st.RegisterTrackStats(stats.InputVideo)

@@ -54,13 +54,15 @@ type process struct {
 
 	params           *params.Params
 	retryCount       int
-	cmd              *exec.Cmd
 	grpcClient       atomic.Pointer[ipc.IngressHandlerClient]
 	ipcHandlerClient *ipc.IngressHandlerClientWrapper
 	ipcServiceServer *grpc.Server
 	rpcServer        rpc.IngressHandlerServer
 	closed           core.Fuse
 	proc             atomic.Pointer[os.Process]
+	processMu        sync.Mutex
+	stopRequested    bool
+	stopSignal       os.Signal
 	killArmed        core.Fuse
 	forceKilled      atomic.Bool
 	lastInfo         atomic.Pointer[livekit.IngressInfo]
@@ -76,6 +78,8 @@ type ProcessManager struct {
 
 	mu             sync.RWMutex
 	activeHandlers map[string]*process
+	starting       int
+	stopping       bool
 	onFatal        func(p *params.Params, err error)
 }
 
@@ -100,6 +104,19 @@ func (s *ProcessManager) startIngress(ctx context.Context, p *params.Params, clo
 	_, span := tracer.Start(ctx, "Service.startIngress")
 	defer span.End()
 
+	s.mu.Lock()
+	if s.stopping {
+		s.mu.Unlock()
+		return errors.ErrServerShuttingDown
+	}
+	s.starting++
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.starting--
+		s.mu.Unlock()
+	}()
+
 	h := &process{
 		params: p,
 		sessionCloser: func(ctx context.Context) {
@@ -114,9 +131,9 @@ func (s *ProcessManager) startIngress(ctx context.Context, p *params.Params, clo
 				h := s.activeHandlers[p.State.ResourceId]
 				s.mu.Unlock()
 
-				if h != nil && !h.closed.IsBroken() && h.cmd != nil {
+				if h != nil && !h.closed.IsBroken() {
 					logger.Infow("killing handler process still present after termination was requested", "ingressID", h.params.IngressId, "resourceID", p.State.ResourceId, "startedAt", p.State.StartedAt)
-					if err := h.cmd.Process.Signal(syscall.SIGKILL); err != nil {
+					if err := h.requestStop(syscall.SIGKILL); err != nil {
 						logger.Infow("failed to kill process", "error", err, "ingressID", h.params.IngressId)
 					}
 				}
@@ -172,12 +189,19 @@ func (s *ProcessManager) startIngress(ctx context.Context, p *params.Params, clo
 		return err
 	}
 
-	s.sm.IngressStarted(p.IngressInfo, h)
-	s.stateNotifier.SessionStarted(ctx, p.ProjectID, p.IngressInfo)
-
 	s.mu.Lock()
+	if s.stopping {
+		s.mu.Unlock()
+		utils.DeregisterIngressRpcHandlers(h.rpcServer, p.IngressInfo)
+		h.ipcHandlerClient.Close()
+		h.ipcServiceServer.Stop()
+		return errors.ErrServerShuttingDown
+	}
 	s.activeHandlers[p.State.ResourceId] = h
 	s.mu.Unlock()
+
+	s.sm.IngressStarted(p.IngressInfo, h)
+	s.stateNotifier.SessionStarted(ctx, p.ProjectID, p.IngressInfo)
 
 	go s.runHandler(ctx, h, p)
 	started = true
@@ -190,7 +214,11 @@ func (s *ProcessManager) runHandler(ctx context.Context, h *process, p *params.P
 	defer span.End()
 
 	defer func() {
+		h.processMu.Lock()
 		h.closed.Break()
+		h.proc.Store(nil)
+		h.processMu.Unlock()
+
 		if h.forceKilled.Load() {
 			s.publishKilledState(context.WithoutCancel(ctx), h)
 		}
@@ -251,23 +279,42 @@ func (s *ProcessManager) runHandlerTry(ctx context.Context, h *process, p *param
 		span.RecordError(err)
 		return false, err
 	}
-	h.cmd = cmd
 
 	var exitErr *exec.ExitError
 
-	err = h.cmd.Start()
+	err = cmd.Start()
 	if err == nil {
-		h.proc.Store(h.cmd.Process)
-		pid := h.cmd.Process.Pid
+		pid := cmd.Process.Pid
+
+		// Shutdown may race cmd.Start. Publish the process while holding the
+		// lifecycle lock so a concurrent stop either sees it or records a
+		// pending signal that is delivered here.
+		h.processMu.Lock()
+		h.proc.Store(cmd.Process)
+		var signalErr error
+		if h.stopRequested && !h.closed.IsBroken() {
+			signalErr = cmd.Process.Signal(h.stopSignal)
+			if signalErr == nil && h.stopSignal == syscall.SIGKILL {
+				h.forceKilled.Store(true)
+			}
+		}
+		h.processMu.Unlock()
+		if signalErr != nil {
+			logger.Infow("failed to stop handler after startup", "error", signalErr, "ingressID", h.params.IngressId)
+		}
+
 		s.sm.HandlerStarted(h.params.IngressInfo, pid)
-		err = h.cmd.Wait()
+		err = cmd.Wait()
+		h.processMu.Lock()
+		h.proc.CompareAndSwap(cmd.Process, nil)
+		h.processMu.Unlock()
 		// Wait returns only after the output copy has finished.
-		for _, w := range []io.Writer{h.cmd.Stdout, h.cmd.Stderr} {
+		for _, w := range []io.Writer{cmd.Stdout, cmd.Stderr} {
 			if l, ok := w.(*utils.HandlerLogger); ok {
 				_ = l.Close()
 			}
 		}
-		s.sm.HandlerExited(pid, h.cmd.ProcessState)
+		s.sm.HandlerExited(pid, cmd.ProcessState)
 	}
 	switch {
 	case err == nil:
@@ -294,17 +341,52 @@ func (s *ProcessManager) runHandlerTry(ctx context.Context, h *process, p *param
 	}
 }
 
-func (s *ProcessManager) killAll() {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	for _, h := range s.activeHandlers {
-		if !h.closed.IsBroken() {
-			if err := h.cmd.Process.Signal(syscall.SIGINT); err != nil {
-				logger.Errorw("failed to kill process", err, "ingressID", h.params.IngressId)
-			}
+func (s *ProcessManager) shutdown(kill bool) {
+	s.mu.Lock()
+	s.stopping = true
+	handlers := make([]*process, 0, len(s.activeHandlers))
+	if kill {
+		for _, h := range s.activeHandlers {
+			handlers = append(handlers, h)
 		}
 	}
+	s.mu.Unlock()
+
+	for _, h := range handlers {
+		h.killAfter(killGracePeriod)
+		if err := h.requestStop(syscall.SIGINT); err != nil {
+			logger.Errorw("failed to kill process", err, "ingressID", h.params.IngressId)
+		}
+	}
+}
+
+func (s *ProcessManager) IsIdle() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.activeHandlers) == 0 && s.starting == 0
+}
+
+func (p *process) requestStop(sig os.Signal) error {
+	p.processMu.Lock()
+	defer p.processMu.Unlock()
+
+	if p.closed.IsBroken() {
+		return nil
+	}
+	if !p.stopRequested || sig == syscall.SIGKILL {
+		p.stopSignal = sig
+	}
+	p.stopRequested = true
+
+	proc := p.proc.Load()
+	if proc == nil {
+		return nil
+	}
+	err := proc.Signal(p.stopSignal)
+	if err == nil && p.stopSignal == syscall.SIGKILL {
+		p.forceKilled.Store(true)
+	}
+	return err
 }
 
 func (s *ProcessManager) UpdateIngressState(ctx context.Context, req *ipc.UpdateIngressStateRequest) (*emptypb.Empty, error) {
@@ -320,7 +402,7 @@ func (s *ProcessManager) UpdateIngressState(ctx context.Context, req *ipc.Update
 	return &emptypb.Empty{}, s.stateNotifier.UpdateIngressState(ctx, req.ProjectId, req.Info)
 }
 
-// killAfter SIGKILLs the handler if it is still running d after termination was
+// killAfter SIGKILLs the handler if it is still running after termination was
 // requested. Only the first request arms it.
 func (p *process) killAfter(d time.Duration) {
 	if !p.killArmed.Break() {
@@ -328,15 +410,29 @@ func (p *process) killAfter(d time.Duration) {
 	}
 
 	time.AfterFunc(d, func() {
+		p.processMu.Lock()
+		if p.closed.IsBroken() {
+			p.processMu.Unlock()
+			return
+		}
 		proc := p.proc.Load()
-		if p.closed.IsBroken() || proc == nil {
+		if proc == nil {
+			// The escalation deadline can expire while a handler is being
+			// constructed or between retries. Preserve SIGKILL for the next
+			// runHandlerTry instead of losing escalation when no process is published.
+			p.stopRequested = true
+			p.stopSignal = syscall.SIGKILL
+			p.processMu.Unlock()
 			return
 		}
 		logger.Warnw("killing handler still running after termination was requested", nil,
 			"ingressID", p.params.IngressId, "resourceID", p.params.State.ResourceId, "gracePeriod", d)
-		p.forceKilled.Store(true)
-		if err := proc.Signal(syscall.SIGKILL); err != nil {
-			p.forceKilled.Store(false)
+		err := proc.Signal(syscall.SIGKILL)
+		if err == nil {
+			p.forceKilled.Store(true)
+		}
+		p.processMu.Unlock()
+		if err != nil {
 			logger.Infow("failed to kill process", "error", err, "ingressID", p.params.IngressId)
 		}
 	})

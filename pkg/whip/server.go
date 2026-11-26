@@ -18,7 +18,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"hash/crc32"
 	"io"
 	"net/http"
 	"strings"
@@ -41,6 +40,7 @@ import (
 )
 
 const (
+	maxWHIPRequestBytes = 1 << 20
 	sdpResponseTimeout  = 5 * time.Second
 	sessionStartTimeout = 10 * time.Second
 	rpcTimeout          = 5 * time.Second
@@ -85,6 +85,28 @@ type WHIPHandler interface {
 	Close()
 	AssociateRelay(kind types.StreamKind, token string, w io.WriteCloser) error
 	DissociateRelay(kind types.StreamKind)
+}
+
+type readyRunner interface {
+	runReady(func()) bool
+}
+
+func invokeReady(
+	h WHIPHandler,
+	ready func(map[types.StreamKind]string, error) *stats.LocalMediaStatsGatherer,
+	mimeTypes map[types.StreamKind]string,
+	err error,
+) (*stats.LocalMediaStatsGatherer, bool) {
+	if ready == nil {
+		return nil, true
+	}
+	var result *stats.LocalMediaStatsGatherer
+	call := func() { result = ready(mimeTypes, err) }
+	if runner, ok := h.(readyRunner); ok {
+		return result, runner.runReady(call)
+	}
+	call()
+	return result, true
 }
 
 func NewWHIPServer(bus psrpc.MessageBus) (*WHIPServer, error) {
@@ -197,10 +219,13 @@ func (s *WHIPServer) Start(
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Expose-Headers", "ETag")
 
-		body, err := io.ReadAll(r.Body)
+		body, err := readWHIPRequestBody(w, r)
 		if err != nil {
 			logger.Infow("WHIP ICE Restart failed to read body", "error", err, "streamKey", streamKey, "resourceID", resourceID)
-			s.handleError(errors.ErrInvalidWHIPRestartRequest, w)
+			var committedErr *responseCommittedHTTPError
+			if !errors.As(err, &committedErr) {
+				s.handleError(errors.ErrInvalidWHIPRestartRequest, w)
+			}
 			return
 		}
 
@@ -314,16 +339,60 @@ func (s *WHIPServer) IsIdle() bool {
 
 func (s *WHIPServer) handleError(err error, w http.ResponseWriter) {
 	var psrpcErr psrpc.Error
+	var committedErr *responseCommittedHTTPError
+	var canceledErr *requestCanceledHTTPError
 	switch {
 	case errors.As(err, &psrpcErr):
 		w.WriteHeader(psrpcErr.ToHttp())
 		_, _ = w.Write([]byte(psrpcErr.Error()))
+	case errors.As(err, &committedErr):
+		logger.Debugw("WHIP response was already committed", "error", err)
+	case errors.As(err, &canceledErr):
+		logger.Debugw("WHIP request was canceled before its response", "error", err)
 	case err == nil:
 		// Nothing, we already responded
 	default:
 		logger.Debugw("whip request failed", "error", err)
 		w.WriteHeader(http.StatusInternalServerError)
 	}
+}
+
+type responseCommittedHTTPError struct {
+	cause error
+}
+
+type requestCanceledHTTPError struct {
+	cause error
+}
+
+func (e *requestCanceledHTTPError) Error() string {
+	return fmt.Sprintf("WHIP request canceled before response: %v", e.cause)
+}
+
+func (e *requestCanceledHTTPError) Unwrap() error {
+	return e.cause
+}
+
+func readWHIPRequestBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxWHIPRequestBytes))
+	if err == nil {
+		return body, nil
+	}
+
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		http.Error(w, "WHIP request body exceeds the 1 MiB limit", http.StatusRequestEntityTooLarge)
+		return nil, &responseCommittedHTTPError{cause: err}
+	}
+	return nil, err
+}
+
+func (e *responseCommittedHTTPError) Error() string {
+	return fmt.Sprintf("WHIP response already committed: %v", e.cause)
+}
+
+func (e *responseCommittedHTTPError) Unwrap() error {
+	return e.cause
 }
 
 func (s *WHIPServer) handleNewWhipClient(w http.ResponseWriter, r *http.Request, streamKey string) (err error) {
@@ -338,44 +407,101 @@ func (s *WHIPServer) handleNewWhipClient(w http.ResponseWriter, r *http.Request,
 
 	sdpOffer := bytes.Buffer{}
 
-	_, err = io.Copy(&sdpOffer, r.Body)
+	body, err := readWHIPRequestBody(w, r)
 	if err != nil {
 		return err
 	}
+	_, _ = sdpOffer.Write(body)
 
 	logger.Debugw("new whip request", "streamKey", streamKey, "sdpOffer", sdpOffer.String(), "userAgent", r.Header.Get("User-Agent"))
 
-	resourceId, res, err := s.createStream(streamKey, sdpOffer.String(), r.Header.Get("User-Agent"))
+	resourceId, res, abortSession, err := s.createStream(r.Context(), streamKey, sdpOffer.String(), r.Header.Get("User-Agent"))
 	if err != nil {
 		return err
 	}
+	responseComplete := make(chan struct{})
+	var responseMu sync.Mutex
+	responseDelivered := false
+	responseAborted := false
+	go func() {
+		select {
+		case <-r.Context().Done():
+			responseMu.Lock()
+			shouldAbort := !responseDelivered && !responseAborted
+			if shouldAbort {
+				responseAborted = true
+			}
+			responseMu.Unlock()
+			if shouldAbort {
+				abortSession()
+			}
+		case <-responseComplete:
+		}
+	}()
+	defer close(responseComplete)
+
+	responseMu.Lock()
+	if responseAborted || r.Context().Err() != nil {
+		cancelErr := r.Context().Err()
+		if cancelErr == nil {
+			cancelErr = context.Canceled
+		}
+		responseAborted = true
+		responseMu.Unlock()
+		abortSession()
+		return &requestCanceledHTTPError{cause: cancelErr}
+	}
+
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Expose-Headers", "Location, Link, ETag")
 	w.Header().Set("Content-Type", "application/sdp")
 	w.Header().Set("Location", fmt.Sprintf("/%s/%s/%s", app, streamKey, resourceId))
 	etag := res.ETag
 	if etag == "" {
-		etag = fmt.Sprintf("%08x", crc32.ChecksumIEEE(sdpOffer.Bytes()))
+		etag = fmt.Sprintf("\"%s\"", resourceId)
 	}
 	w.Header().Set("ETag", etag)
 	for _, l := range res.LinkHeaders {
 		w.Header().Add("Link", l)
 	}
 	w.WriteHeader(http.StatusCreated)
-	_, _ = w.Write([]byte(res.SDPAnswer))
+	written, writeErr := io.WriteString(w, res.SDPAnswer)
+	if writeErr == nil && written != len(res.SDPAnswer) {
+		writeErr = io.ErrShortWrite
+	}
+	if writeErr == nil {
+		if flushErr := http.NewResponseController(w).Flush(); flushErr != nil && !errors.Is(flushErr, http.ErrNotSupported) {
+			writeErr = flushErr
+		}
+	}
+	if writeErr == nil {
+		// Commit successful delivery before the request context is released. The
+		// server cancels that context when this handler returns, which must not
+		// tear down a WHIP session whose 201 response was already flushed.
+		responseDelivered = true
+	} else {
+		responseAborted = true
+	}
+	responseMu.Unlock()
+	if writeErr != nil {
+		abortSession()
+		return &responseCommittedHTTPError{cause: writeErr}
+	}
 
 	return nil
 }
 
-func (s *WHIPServer) createStream(streamKey string, sdpOffer string, ua string) (string, *WHIPInitResponse, error) {
+func (s *WHIPServer) createStream(requestCtx context.Context, streamKey string, sdpOffer string, ua string) (string, *WHIPInitResponse, func(), error) {
 	ctx, done := context.WithTimeout(s.ctx, sdpResponseTimeout)
+	stopRequestCancel := context.AfterFunc(requestCtx, done)
+	defer stopRequestCancel()
 	defer done()
 
 	resourceId := utils.NewGuid(utils.WHIPResourcePrefix)
 
 	p, ready, ended, err := s.onPublish(streamKey, resourceId)
 	if err != nil {
-		return "", nil, err
+		return "", nil, nil, err
 	}
 
 	h, err := s.newHandler(p, streamKey, resourceId, ua)
@@ -383,36 +509,44 @@ func (s *WHIPServer) createStream(streamKey string, sdpOffer string, ua string) 
 		// The caller is handed ready and ended together and expects one of
 		// them; returning without either strands whatever it set up.
 		ready(nil, err)
-		return "", nil, err
+		return "", nil, nil, err
 	}
 
 	sdpResponse, err := h.Init(ctx, sdpOffer)
 	if err != nil {
-		ready(nil, err)
+		invokeReady(h, ready, nil, err)
 
 		h.Close()
-		return "", nil, err
+		return "", nil, nil, err
 	}
 
+	sessionCtx, cancelSession := context.WithTimeout(s.ctx, sessionStartTimeout)
 	go func() {
-		ctx, done := context.WithTimeout(s.ctx, sessionStartTimeout)
-		defer done()
+		defer cancelSession()
 
 		s.handlersLock.Lock()
 		s.handlers[resourceId] = h
 		s.handlersLock.Unlock()
 
-		mimeTypes, err := h.Start(ctx)
+		mimeTypes, err := h.Start(sessionCtx)
 
 		// Call ready here rather than on the way out. The goroutine below
 		// calls ended, and a session whose done channel is already broken
 		// reaches ended without blocking, so deferring ready lets ended
 		// overtake it -- ready sends a state update, and the round trip is
 		// long enough for the whole of ended to run in the middle of it.
-		if ready != nil {
-			if stats := ready(mimeTypes, err); stats != nil {
-				h.SetMediaStatsGatherer(stats)
-			}
+		readyStats, readyInvoked := invokeReady(h, ready, mimeTypes, err)
+		if !readyInvoked {
+			h.Close()
+
+			s.handlersLock.Lock()
+			delete(s.handlers, resourceId)
+			s.handlersLock.Unlock()
+
+			return
+		}
+		if readyStats != nil {
+			h.SetMediaStatsGatherer(readyStats)
 		}
 
 		if err != nil {
@@ -448,7 +582,14 @@ func (s *WHIPServer) createStream(streamKey string, sdpOffer string, ua string) 
 		}()
 	}()
 
-	return resourceId, sdpResponse, nil
+	var abortOnce sync.Once
+	abortSession := func() {
+		abortOnce.Do(func() {
+			cancelSession()
+			h.Close()
+		})
+	}
+	return resourceId, sdpResponse, abortSession, nil
 }
 
 func (s *WHIPServer) createHandler(p *params.Params, streamKey, resourceId, ua string) (WHIPHandler, error) {

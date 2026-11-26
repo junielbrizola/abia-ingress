@@ -100,7 +100,7 @@ func TestReadyReturnsBeforeEnded(t *testing.T) {
 		return p, ready, ended, nil
 	}
 
-	_, _, err := s.createStream("stream_key", "sdp_offer", "test")
+	_, _, _, err := s.createStream(context.Background(), "stream_key", "sdp_offer", "test")
 	require.NoError(t, err)
 
 	for _, ch := range []chan struct{}{readyReturned, endedCalled} {
