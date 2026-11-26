@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-name: Release to Docker
+name: Build ABIA Ingress (publication disabled)
 
 # Controls when the action will run.
 on:
@@ -44,7 +44,7 @@ jobs:
         id: docker-md
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
-          images: livekit/ingress
+          images: abia-realtime-ingress
           # generate Docker tags based on the following events/attributes
           tags: |
             type=semver,pattern=v{{version}}
@@ -56,18 +56,14 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      - name: Login to DockerHub
-        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Build and push
+      - name: Build Ingress image (publication disabled)
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: ./build/ingress/Dockerfile
-          push: true
+          # Verification only. ABIA publication stays disabled until its Artifact Registry
+          # destination and authorized publishing identity are configured explicitly.
+          push: false
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.docker-md.outputs.tags }}
           labels: ${{ steps.docker-md.outputs.labels }}

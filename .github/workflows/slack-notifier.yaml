@@ -8,8 +8,6 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
-  issues: write
 
 concurrency:
   group: pr-slack-${{ github.event.pull_request.number }}-${{ github.workflow }}
@@ -17,6 +15,11 @@ concurrency:
 
 jobs:
   notify-devs:
+    if: github.repository == 'livekit/ingress'
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
     runs-on: ubuntu-latest
     steps:
       - uses: livekit/slack-notifier-action@4d4c67c421a4190cec360a22328c4ae1186a8875 # main

@@ -40,6 +40,9 @@ permissions:
 jobs:
   integration:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/realtime/ingress
     # The suite's own deadline is 20m, so this only catches a hang outside it.
     timeout-minutes: 25
     strategy:
@@ -53,6 +56,23 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
+          path: apps/realtime/ingress
+
+      # The fixture builds the server fork from the same monorepo context as
+      # ABIA's server image; these pins match the root repository gitlinks.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: junielbrizola/abia-realtime-server
+          ref: c5c8ec507dfec495e89eb64a3370645473d4f6b7
+          token: ${{ secrets.ABIA_SUBMODULES_READ_TOKEN || github.token }}
+          path: apps/realtime/server
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: junielbrizola/abia-protocol
+          ref: 36e1b27375d9f560868642642bdd0f669a610756
+          token: ${{ secrets.ABIA_SUBMODULES_READ_TOKEN || github.token }}
+          path: apps/realtime/protocol
 
       - name: Read the pinned GStreamer version
         id: gst-version
@@ -74,14 +94,20 @@ jobs:
           room_name: ingress-integration-${{ matrix.suite }}
           EOF
 
+      - name: Build the ${{ matrix.suite }} suite images
+        env:
+          INGRESS_TEST_CONFIG: /tmp/ingress-integration.yaml
+          GSTVERSION: ${{ steps.gst-version.outputs.version }}
+          SECURITY_REFRESH: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: docker compose -f build/test/compose.yaml build livekit test
+
       - name: Run the ${{ matrix.suite }} suite
         env:
           INTEGRATION_TYPE: ${{ matrix.suite }}
           INGRESS_TEST_CONFIG: /tmp/ingress-integration.yaml
           GSTVERSION: ${{ steps.gst-version.outputs.version }}
           SECURITY_REFRESH: ${{ github.run_id }}-${{ github.run_attempt }}
-        # --build because run reuses whatever image already exists.
-        run: docker compose -f build/test/compose.yaml run --build --rm test
+        run: docker compose -f build/test/compose.yaml run --rm test
 
       # Compose interpolates the whole file whatever the command, so this
       # needs the same variables the run step does or it fails instead of
