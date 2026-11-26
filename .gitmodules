@@ -1,4 +1,4 @@
 [submodule "test/livekit-whip-bot"]
 	path = test/livekit-whip-bot
-	url = https://github.com/cloudwebrtc/livekit-whip-bot
+	url = https://github.com/junielbrizola/abia-livekit-whip-bot.git
 	branch = test_devices
